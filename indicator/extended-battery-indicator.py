@@ -95,14 +95,23 @@ class BatteryIndicator:
                 ["sudo", SCRIPT, "status"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=15,
             )
             return json.loads(result.stdout)
         except Exception:
             return None
 
-    def update_status(self):
-        status = self.get_status()
+    def _do_update(self):
+        """Run status check in background thread, then update UI on main thread."""
+        import threading
+
+        def _fetch():
+            status = self.get_status()
+            GLib.idle_add(self._apply_status, status)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    def _apply_status(self, status):
         on = self.is_on()
 
         if on:
@@ -129,13 +138,14 @@ class BatteryIndicator:
                 m = int((hours - h) * 60)
                 self.remaining_item.set_label(f"Remaining: ~{h}h {m}m")
             else:
-                self.remaining_item.set_label(f"Remaining: N/A")
+                self.remaining_item.set_label("Remaining: N/A")
 
-            # Update indicator description
-            self.indicator.set_title(
-                f"Battery: {mode_str} | {pct}%"
-            )
+            self.indicator.set_title(f"Battery: {mode_str} | {pct}%")
 
+        return False  # Don't repeat idle_add
+
+    def update_status(self):
+        self._do_update()
         return True  # Keep the timeout active
 
     def on_toggle(self, _widget):
