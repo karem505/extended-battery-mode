@@ -205,15 +205,15 @@ mode_status() {
     local wifi_ps
     wifi_ps=$(iw dev "$WIFI_IFACE" get power_save 2>/dev/null | awk '{print $NF}' || echo "?")
 
-    # Battery info — parse uevent for charge-based batteries (no power_now/energy_now)
+    # Battery info
     local bat_pct bat_status power_w time_remaining
     bat_pct=$(cat "$BAT_PATH/capacity" 2>/dev/null || echo "?")
     bat_status=$(cat "$BAT_PATH/status" 2>/dev/null || echo "?")
     power_w="N/A"
     time_remaining="N/A"
 
-    # Try power_now first (energy-based batteries)
-    if [[ -r "$BAT_PATH/power_now" ]]; then
+    # Method 1: power_now (energy-reporting batteries, e.g. ThinkPads)
+    if [[ "$power_w" == "N/A" && -r "$BAT_PATH/power_now" ]]; then
         local power_now_uw
         power_now_uw=$(cat "$BAT_PATH/power_now" 2>/dev/null || echo "0")
         if [[ "$power_now_uw" != "0" ]]; then
@@ -226,32 +226,70 @@ mode_status() {
         fi
     fi
 
-    # Fallback: compute from voltage_now * current_now (charge-based batteries)
+    # Method 2: RAPL energy counters (works on Intel, requires root — which we have)
+    # Measures actual package power by sampling energy_uj over 1 second
     if [[ "$power_w" == "N/A" ]]; then
-        local voltage_now charge_now charge_full
+        local rapl_path="/sys/class/powercap/intel-rapl:0/energy_uj"
+        if [[ -r "$rapl_path" ]]; then
+            local e1 e2
+            e1=$(cat "$rapl_path" 2>/dev/null || echo "")
+            if [[ -n "$e1" ]]; then
+                sleep 1
+                e2=$(cat "$rapl_path" 2>/dev/null || echo "")
+                if [[ -n "$e2" && "$e2" != "$e1" ]]; then
+                    # RAPL measures CPU package only; add ~30% for display+peripherals
+                    local rapl_w
+                    rapl_w=$(awk "BEGIN {printf \"%.1f\", ($e2 - $e1) / 1000000.0}")
+                    power_w=$(awk "BEGIN {printf \"%.1f\", $rapl_w * 1.3}")
+                fi
+            fi
+        fi
+        # Estimate time remaining from charge if we got power
+        if [[ "$power_w" != "N/A" && "$bat_status" == "Discharging" ]]; then
+            local voltage_now charge_now
+            voltage_now=$(cat "$BAT_PATH/voltage_now" 2>/dev/null || echo "0")
+            charge_now=$(cat "$BAT_PATH/charge_now" 2>/dev/null || echo "0")
+            if [[ "$voltage_now" != "0" && "$charge_now" != "0" ]]; then
+                # energy_remaining (Wh) = voltage (V) * charge (Ah)
+                time_remaining=$(awk "BEGIN {
+                    energy_wh = ($voltage_now / 1000000.0) * ($charge_now / 1000000.0)
+                    printf \"%.1f\", energy_wh / $power_w
+                }")
+            fi
+        fi
+    fi
+
+    # Method 3: voltage_now * current_now from uevent
+    if [[ "$power_w" == "N/A" ]]; then
+        local voltage_now current_now charge_now
         voltage_now=$(grep -oP 'POWER_SUPPLY_VOLTAGE_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
-        local current_now
         current_now=$(grep -oP 'POWER_SUPPLY_CURRENT_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
         charge_now=$(grep -oP 'POWER_SUPPLY_CHARGE_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
-        charge_full=$(grep -oP 'POWER_SUPPLY_CHARGE_FULL=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
 
         if [[ "$current_now" != "0" && "$voltage_now" != "0" ]]; then
             power_w=$(awk "BEGIN {printf \"%.1f\", ($voltage_now * $current_now) / 1000000000000.0}")
             if [[ "$bat_status" == "Discharging" && "$charge_now" != "0" ]]; then
                 time_remaining=$(awk "BEGIN {printf \"%.1f\", $charge_now / $current_now}")
             fi
-        elif [[ "$voltage_now" != "0" && "$charge_now" != "0" && "$charge_full" != "0" ]]; then
+        fi
+    fi
+
+    # Method 4: charge-sampling fallback (needs two calls 10+ seconds apart)
+    if [[ "$power_w" == "N/A" ]]; then
+        local voltage_now charge_now
+        voltage_now=$(cat "$BAT_PATH/voltage_now" 2>/dev/null || echo "0")
+        charge_now=$(cat "$BAT_PATH/charge_now" 2>/dev/null || echo "0")
+        if [[ "$voltage_now" != "0" && "$charge_now" != "0" ]]; then
             local sample_file="/tmp/extended-battery-charge-sample"
             local now_ts
             now_ts=$(date +%s)
             if [[ -f "$sample_file" ]]; then
-                local prev_charge prev_ts
+                local prev_charge prev_ts delta_charge delta_time
                 prev_charge=$(sed -n '1p' "$sample_file")
                 prev_ts=$(sed -n '2p' "$sample_file")
-                local delta_charge delta_time
                 delta_charge=$((prev_charge - charge_now))
                 delta_time=$((now_ts - prev_ts))
-                if [[ "$delta_time" -gt 30 && "$delta_charge" -gt 0 ]]; then
+                if [[ "$delta_time" -gt 10 && "$delta_charge" -gt 0 ]]; then
                     local est_current
                     est_current=$(awk "BEGIN {printf \"%.0f\", $delta_charge * 3600.0 / $delta_time}")
                     power_w=$(awk "BEGIN {printf \"%.1f\", ($voltage_now * $est_current) / 1000000000000.0}")
