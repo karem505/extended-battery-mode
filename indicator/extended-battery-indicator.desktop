@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Extended Battery Indicator
+Comment=Panel indicator for Extended Battery Mode
+Exec=/usr/bin/python3 HOME_PLACEHOLDER/.local/bin/extended-battery-indicator.py
+Icon=battery-symbolic
+X-GNOME-Autostart-enabled=true
+Terminal=false
+Categories=Utility;

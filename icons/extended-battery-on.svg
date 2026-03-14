@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Battery body -->
+  <rect x="1" y="4" width="12" height="8" rx="1.5" ry="1.5" fill="none" stroke="#4caf50" stroke-width="1.2"/>
+  <!-- Battery terminal -->
+  <rect x="13" y="6" width="2" height="4" rx="0.5" ry="0.5" fill="#4caf50"/>
+  <!-- Fill level (low to show saving) -->
+  <rect x="2.2" y="5.2" width="4" height="5.6" rx="0.5" fill="#4caf50" opacity="0.9"/>
+  <!-- Leaf icon (eco) -->
+  <path d="M8.5 5.5 C10.5 5.5 11.5 7 11.5 8.5 C11.5 10 10 11 8.5 11 C8.5 11 9 9.5 8.5 8.5 C8 7.5 7 7 7 7 C7 7 7.5 5.5 8.5 5.5Z" fill="#4caf50" opacity="0.85"/>
+  <line x1="8.5" y1="8.5" x2="7.5" y2="10.5" stroke="#2e7d32" stroke-width="0.5" stroke-linecap="round"/>
+</svg>

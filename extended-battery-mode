@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# Extended Battery Mode for Linux Laptops (Intel)
+# Toggleable power-saving profile: CPU throttle, display dim, peripheral power management
+# Must be run as root (via sudo)
+
+set -euo pipefail
+
+STATE_FILE="/tmp/extended-battery-mode.state"
+BACKLIGHT_PATH="/sys/class/backlight/intel_backlight"
+PSTATE_PATH="/sys/devices/system/cpu/intel_pstate"
+BAT_PATH="/sys/class/power_supply/BAT0"
+
+# Auto-detect WiFi interface
+WIFI_IFACE=$(iw dev 2>/dev/null | awk '$1=="Interface"{print $2; exit}' || echo "wlan0")
+
+MAX_BRIGHTNESS=$(cat "$BACKLIGHT_PATH/max_brightness" 2>/dev/null || echo "24000")
+DIM_BRIGHTNESS=$(( MAX_BRIGHTNESS * 40 / 100 ))   # 40%
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+usage() {
+    echo "Usage: extended-battery-mode {on|off|status|toggle}"
+    echo ""
+    echo "Commands:"
+    echo "  on      Enable extended battery mode (power saving)"
+    echo "  off     Restore normal performance mode"
+    echo "  status  Show current mode and power stats (JSON)"
+    echo "  toggle  Switch between on/off"
+    exit 1
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Error: This script must be run as root (use sudo)" >&2
+        exit 1
+    fi
+}
+
+notify() {
+    local title="$1"
+    local body="$2"
+    local icon="${3:-battery-symbolic}"
+    # Send notification as the real user (not root)
+    local real_user="${SUDO_USER:-$USER}"
+    local real_uid
+    real_uid=$(id -u "$real_user" 2>/dev/null || echo "1000")
+    sudo -u "$real_user" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${real_uid}/bus" \
+        notify-send -i "$icon" "$title" "$body" 2>/dev/null || true
+}
+
+write_sysfs() {
+    local path="$1"
+    local value="$2"
+    if [[ -w "$path" ]]; then
+        echo "$value" > "$path"
+    else
+        echo "Warning: Cannot write to $path" >&2
+    fi
+}
+
+is_on() {
+    [[ -f "$STATE_FILE" ]]
+}
+
+mode_on() {
+    check_root
+    echo -e "${GREEN}Enabling Extended Battery Mode...${NC}"
+
+    # 1. Disable turbo boost
+    write_sysfs "$PSTATE_PATH/no_turbo" "1"
+    echo "  [✓] Turbo boost disabled"
+
+    # 2. Cap CPU to 30%
+    write_sysfs "$PSTATE_PATH/max_perf_pct" "30"
+    echo "  [✓] CPU capped to 30%"
+
+    # 3. Set EPP to power on all CPUs
+    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [[ -f "$epp" ]] && write_sysfs "$epp" "power"
+    done
+    echo "  [✓] Energy Performance Preference: power"
+
+    # 4. Dim display to 40%
+    write_sysfs "$BACKLIGHT_PATH/brightness" "$DIM_BRIGHTNESS"
+    echo "  [✓] Brightness set to 40% ($DIM_BRIGHTNESS/$MAX_BRIGHTNESS)"
+
+    # 5. WiFi power save on
+    iw dev "$WIFI_IFACE" set power_save on 2>/dev/null && \
+        echo "  [✓] WiFi power save: on" || \
+        echo "  [!] WiFi power save: failed (interface may be down)"
+
+    # 6. Audio power save
+    if [[ -f /sys/module/snd_hda_intel/parameters/power_save ]]; then
+        write_sysfs /sys/module/snd_hda_intel/parameters/power_save "1"
+        echo "  [✓] Audio codec power save: on"
+    fi
+
+    # 7. ASPM powersupersave
+    if [[ -f /sys/module/pcie_aspm/parameters/policy ]]; then
+        write_sysfs /sys/module/pcie_aspm/parameters/policy "powersupersave"
+        echo "  [✓] ASPM: powersupersave"
+    else
+        echo "  [!] ASPM: not available (kernel parameter needed)"
+    fi
+
+    # 8. Dirty writeback 15s
+    write_sysfs /proc/sys/vm/dirty_writeback_centisecs "1500"
+    echo "  [✓] Dirty writeback: 15s"
+
+    # 9. NMI watchdog off
+    write_sysfs /proc/sys/kernel/nmi_watchdog "0"
+    echo "  [✓] NMI watchdog: off"
+
+    # 10. i915 GPU power savings
+    for param in enable_fbc enable_psr enable_dc; do
+        if [[ -f "/sys/module/i915/parameters/$param" ]]; then
+            write_sysfs "/sys/module/i915/parameters/$param" "1" 2>/dev/null || true
+        fi
+    done
+    echo "  [✓] i915 GPU power savings: enabled"
+
+    # 11. Write state file
+    echo "on" > "$STATE_FILE"
+    date +%s >> "$STATE_FILE"
+    echo ""
+    echo -e "${GREEN}Extended Battery Mode: ON${NC}"
+
+    # 12. Desktop notification
+    notify "Extended Battery Mode" "Power saving enabled — CPU capped at 30%, brightness at 40%" "battery-good-symbolic"
+}
+
+mode_off() {
+    check_root
+    echo -e "${YELLOW}Restoring Normal Mode...${NC}"
+
+    # 1. Re-enable turbo
+    write_sysfs "$PSTATE_PATH/no_turbo" "0"
+    echo "  [✓] Turbo boost enabled"
+
+    # 2. Uncap CPU
+    write_sysfs "$PSTATE_PATH/max_perf_pct" "100"
+    echo "  [✓] CPU uncapped (100%)"
+
+    # 3. EPP to balance_performance
+    for epp in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        [[ -f "$epp" ]] && write_sysfs "$epp" "balance_performance"
+    done
+    echo "  [✓] Energy Performance Preference: balance_performance"
+
+    # 4. Brightness to 100%
+    write_sysfs "$BACKLIGHT_PATH/brightness" "$MAX_BRIGHTNESS"
+    echo "  [✓] Brightness set to 100%"
+
+    # 5. WiFi power save off
+    iw dev "$WIFI_IFACE" set power_save off 2>/dev/null && \
+        echo "  [✓] WiFi power save: off" || \
+        echo "  [!] WiFi power save: failed"
+
+    # 6. Audio power save off
+    if [[ -f /sys/module/snd_hda_intel/parameters/power_save ]]; then
+        write_sysfs /sys/module/snd_hda_intel/parameters/power_save "0"
+        echo "  [✓] Audio codec power save: off"
+    fi
+
+    # 7. ASPM default
+    if [[ -f /sys/module/pcie_aspm/parameters/policy ]]; then
+        write_sysfs /sys/module/pcie_aspm/parameters/policy "default"
+        echo "  [✓] ASPM: default"
+    fi
+
+    # 8. Dirty writeback default
+    write_sysfs /proc/sys/vm/dirty_writeback_centisecs "500"
+    echo "  [✓] Dirty writeback: 5s"
+
+    # 9. NMI watchdog on
+    write_sysfs /proc/sys/kernel/nmi_watchdog "1"
+    echo "  [✓] NMI watchdog: on"
+
+    # 10. Remove state file
+    rm -f "$STATE_FILE"
+    echo ""
+    echo -e "${YELLOW}Extended Battery Mode: OFF${NC}"
+
+    # 11. Desktop notification
+    notify "Extended Battery Mode" "Normal performance restored" "battery-symbolic"
+}
+
+mode_status() {
+    local mode="off"
+    is_on && mode="on"
+
+    # Read current values
+    local turbo_off no_turbo_val max_pct epp brightness
+    no_turbo_val=$(cat "$PSTATE_PATH/no_turbo" 2>/dev/null || echo "?")
+    [[ "$no_turbo_val" == "1" ]] && turbo_off="true" || turbo_off="false"
+    max_pct=$(cat "$PSTATE_PATH/max_perf_pct" 2>/dev/null || echo "?")
+    epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo "?")
+    brightness=$(cat "$BACKLIGHT_PATH/brightness" 2>/dev/null || echo "?")
+
+    # WiFi power save
+    local wifi_ps
+    wifi_ps=$(iw dev "$WIFI_IFACE" get power_save 2>/dev/null | awk '{print $NF}' || echo "?")
+
+    # Battery info — parse uevent for charge-based batteries (no power_now/energy_now)
+    local bat_pct bat_status power_w time_remaining
+    bat_pct=$(cat "$BAT_PATH/capacity" 2>/dev/null || echo "?")
+    bat_status=$(cat "$BAT_PATH/status" 2>/dev/null || echo "?")
+    power_w="N/A"
+    time_remaining="N/A"
+
+    # Try power_now first (energy-based batteries)
+    if [[ -r "$BAT_PATH/power_now" ]]; then
+        local power_now_uw
+        power_now_uw=$(cat "$BAT_PATH/power_now" 2>/dev/null || echo "0")
+        if [[ "$power_now_uw" != "0" ]]; then
+            power_w=$(awk "BEGIN {printf \"%.1f\", $power_now_uw / 1000000}")
+            local energy_now_uh
+            energy_now_uh=$(cat "$BAT_PATH/energy_now" 2>/dev/null || echo "0")
+            if [[ "$energy_now_uh" != "0" && "$bat_status" == "Discharging" ]]; then
+                time_remaining=$(awk "BEGIN {printf \"%.1f\", $energy_now_uh / $power_now_uw}")
+            fi
+        fi
+    fi
+
+    # Fallback: compute from voltage_now * current_now (charge-based batteries)
+    if [[ "$power_w" == "N/A" ]]; then
+        local voltage_now charge_now charge_full
+        voltage_now=$(grep -oP 'POWER_SUPPLY_VOLTAGE_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
+        local current_now
+        current_now=$(grep -oP 'POWER_SUPPLY_CURRENT_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
+        charge_now=$(grep -oP 'POWER_SUPPLY_CHARGE_NOW=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
+        charge_full=$(grep -oP 'POWER_SUPPLY_CHARGE_FULL=\K\d+' "$BAT_PATH/uevent" 2>/dev/null || echo "0")
+
+        if [[ "$current_now" != "0" && "$voltage_now" != "0" ]]; then
+            power_w=$(awk "BEGIN {printf \"%.1f\", ($voltage_now * $current_now) / 1000000000000.0}")
+            if [[ "$bat_status" == "Discharging" && "$charge_now" != "0" ]]; then
+                time_remaining=$(awk "BEGIN {printf \"%.1f\", $charge_now / $current_now}")
+            fi
+        elif [[ "$voltage_now" != "0" && "$charge_now" != "0" && "$charge_full" != "0" ]]; then
+            local sample_file="/tmp/extended-battery-charge-sample"
+            local now_ts
+            now_ts=$(date +%s)
+            if [[ -f "$sample_file" ]]; then
+                local prev_charge prev_ts
+                prev_charge=$(sed -n '1p' "$sample_file")
+                prev_ts=$(sed -n '2p' "$sample_file")
+                local delta_charge delta_time
+                delta_charge=$((prev_charge - charge_now))
+                delta_time=$((now_ts - prev_ts))
+                if [[ "$delta_time" -gt 30 && "$delta_charge" -gt 0 ]]; then
+                    local est_current
+                    est_current=$(awk "BEGIN {printf \"%.0f\", $delta_charge * 3600.0 / $delta_time}")
+                    power_w=$(awk "BEGIN {printf \"%.1f\", ($voltage_now * $est_current) / 1000000000000.0}")
+                    if [[ "$bat_status" == "Discharging" ]]; then
+                        time_remaining=$(awk "BEGIN {printf \"%.1f\", $charge_now / $est_current}")
+                    fi
+                fi
+            fi
+            echo "$charge_now" > "$sample_file"
+            echo "$now_ts" >> "$sample_file"
+        fi
+    fi
+
+    # ASPM
+    local aspm
+    aspm=$(cat /sys/module/pcie_aspm/parameters/policy 2>/dev/null | grep -oP '\[\K[^\]]+' || echo "?")
+
+    # Audio power save
+    local audio_ps
+    audio_ps=$(cat /sys/module/snd_hda_intel/parameters/power_save 2>/dev/null || echo "?")
+
+    cat <<EOF
+{
+  "mode": "$mode",
+  "parameters": {
+    "turbo_disabled": $turbo_off,
+    "max_perf_pct": $max_pct,
+    "epp": "$epp",
+    "brightness": $brightness,
+    "brightness_pct": $(awk "BEGIN {printf \"%.0f\", ($brightness / $MAX_BRIGHTNESS) * 100}"),
+    "wifi_power_save": "$wifi_ps",
+    "audio_power_save": $audio_ps,
+    "aspm": "$aspm"
+  },
+  "battery": {
+    "percentage": $bat_pct,
+    "status": "$bat_status",
+    "power_draw_watts": "$power_w",
+    "time_remaining_hours": "$time_remaining"
+  }
+}
+EOF
+}
+
+mode_toggle() {
+    if is_on; then
+        mode_off
+    else
+        mode_on
+    fi
+}
+
+# Main
+case "${1:-}" in
+    on)     mode_on ;;
+    off)    mode_off ;;
+    status) mode_status ;;
+    toggle) mode_toggle ;;
+    *)      usage ;;
+esac
